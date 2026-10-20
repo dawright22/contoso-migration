@@ -3,7 +3,7 @@
 
 provider "aws" {
   region  = var.region
-  profile = "terraform"
+  profile = var.aws_profile
 }
 
 # VPC and Networking
@@ -51,8 +51,8 @@ resource "aws_route_table" "main" {
   vpc_id = aws_vpc.main.id
 
   route {
-    cidr_block      = "0.0.0.0/0"
-    gateway_id      = aws_internet_gateway.main.id
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
   }
 
   tags = {
@@ -75,9 +75,9 @@ data "aws_availability_zones" "available" {
 }
 
 # Security Groups
-resource "aws_security_group" "web" {
-  name        = "${var.app_name}-web-sg"
-  description = "Security group for Contoso web application"
+resource "aws_security_group" "alb" {
+  name        = "${var.app_name}-alb-sg"
+  description = "Public HTTP access to the load balancer"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -87,25 +87,24 @@ resource "aws_security_group" "web" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+}
+
+resource "aws_security_group" "web" {
+  name        = "${var.app_name}-web-sg"
+  description = "Application access from the load balancer only"
+  vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port   = 3000
-    to_port     = 3000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port       = 3000
+    to_port         = 3000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
   egress {
@@ -138,10 +137,10 @@ resource "aws_s3_bucket_versioning" "app_bucket" {
 }
 
 resource "aws_s3_object" "app_archive" {
-  bucket = aws_s3_bucket.app_bucket.id
-  key    = "artifacts/${basename(var.app_artifact_path)}"
-  source = "${path.module}/${var.app_artifact_path}"
-  etag   = filemd5("${path.module}/${var.app_artifact_path}")
+  bucket      = aws_s3_bucket.app_bucket.id
+  key         = "artifacts/${local.app_archive_sha256}/${basename(var.app_artifact_path)}"
+  source      = abspath(var.app_artifact_path)
+  source_hash = local.app_archive_sha256
 }
 
 data "aws_caller_identity" "current" {}
@@ -170,16 +169,17 @@ resource "aws_iam_role_policy" "ec2_policy" {
     Version = "2012-10-17"
     Statement = [{
       Effect = "Allow"
-      Action = [
-        "s3:GetObject",
-        "s3:ListBucket"
-      ]
+      Action = ["s3:GetObject"]
       Resource = [
-        aws_s3_bucket.app_bucket.arn,
-        "${aws_s3_bucket.app_bucket.arn}/*"
+        "${aws_s3_bucket.app_bucket.arn}/${aws_s3_object.app_archive.key}"
       ]
     }]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "ec2_profile" {
@@ -206,30 +206,37 @@ data "aws_ami" "ubuntu" {
 
 # User Data Script for Application Deployment
 locals {
-  user_data_script = base64encode(templatefile("${path.module}/user_data.sh", {
-    app_name       = var.app_name
-    node_env       = var.node_env
+  app_archive_sha256 = filesha256(abspath(var.app_artifact_path))
+  user_data_script = replace(templatefile("${path.module}/user_data.sh", {
+    app_name        = var.app_name
+    node_env        = var.node_env
     artifact_bucket = aws_s3_bucket.app_bucket.id
     artifact_key    = aws_s3_object.app_archive.key
-  }))
+    artifact_sha256 = local.app_archive_sha256
+  }), "\r\n", "\n")
 }
 
 # EC2 Instance
 resource "aws_instance" "web" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.main.id
-  vpc_security_group_ids = [aws_security_group.web.id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
-  user_data              = local.user_data_script
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.main.id
+  vpc_security_group_ids      = [aws_security_group.web.id]
+  iam_instance_profile        = aws_iam_instance_profile.ec2_profile.name
+  user_data                   = local.user_data_script
   user_data_replace_on_change = true
 
   associate_public_ip_address = true
+
+  metadata_options {
+    http_tokens = "required"
+  }
 
   root_block_device {
     volume_type           = "gp3"
     volume_size           = 30
     delete_on_termination = true
+    encrypted             = true
   }
 
   tags = {
@@ -237,7 +244,9 @@ resource "aws_instance" "web" {
   }
 
   depends_on = [
-    aws_internet_gateway.main,
+    aws_route_table_association.main,
+    aws_iam_role_policy.ec2_policy,
+    aws_iam_role_policy_attachment.ssm,
     aws_s3_object.app_archive
   ]
 }
@@ -247,7 +256,7 @@ resource "aws_lb" "main" {
   name               = "${var.app_name}-alb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.web.id]
+  security_groups    = [aws_security_group.alb.id]
   subnets            = [aws_subnet.main.id, aws_subnet.secondary.id]
 
   enable_deletion_protection = false

@@ -31,3 +31,11 @@ override.tf.json
 # Local app artifact generated for Terraform upload
 app/*.tar.gz
 
+# Application dependencies and build output
+**/node_modules/
+**/.next/
+**/next-env.d.ts
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+*.tfplan

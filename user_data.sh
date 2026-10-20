@@ -1,93 +1,63 @@
 #!/bin/bash
-set -e
-
-# User Data Script for Contoso Web Deployment
-# This script deploys the Contoso web application to the EC2 instance
+set -Eeuo pipefail
+trap 'echo "Contoso bootstrap failed at line $LINENO" >&2' ERR
+export DEBIAN_FRONTEND=noninteractive
 
 echo "Starting Contoso Web deployment..."
-
-# Update system packages
 apt-get update
-apt-get upgrade -y
+apt-get install -y ca-certificates curl awscli
+curl --fail --silent --show-error --location https://deb.nodesource.com/setup_22.x -o /tmp/contoso-node-setup.sh
+bash /tmp/contoso-node-setup.sh
+apt-get install -y nodejs
+rm /tmp/contoso-node-setup.sh
 
-# Install Node.js and npm
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-apt-get install -y nodejs awscli
-
-# Install PM2 for process management
-npm install -g pm2
-
-# Create application directory
 mkdir -p /opt/${app_name}
 cd /opt/${app_name}
 
-# Fetch the application package from the private S3 artifact bucket.
-echo "Fetching application archive from s3://${artifact_bucket}/${artifact_key}..."
-aws s3 cp "s3://${artifact_bucket}/${artifact_key}" ./app.tar.gz
-tar -xzf ./app.tar.gz --strip-components=1
-rm -f ./app.tar.gz
-echo "Application archive extracted successfully"
+echo "Downloading application archive..."
+aws s3 cp "s3://${artifact_bucket}/${artifact_key}" /tmp/contoso-app.tar.gz
+echo "${artifact_sha256}  /tmp/contoso-app.tar.gz" | sha256sum --check -
+tar -xzf /tmp/contoso-app.tar.gz --strip-components=1
+rm /tmp/contoso-app.tar.gz
 
-# Disable chat functionality by modifying environment
-# Create .env file without chat endpoints
-cat > .env.production << EOF
-# Contoso Web Configuration (Chat disabled)
-NODE_ENV=${node_env}
+npm ci --include=dev --no-fund --no-audit
+NEXT_TELEMETRY_DISABLED=1 npm run build
+npm prune --omit=dev --no-fund --no-audit
+
+useradd --system --home-dir /opt/${app_name} --shell /usr/sbin/nologin ${app_name}
+chown -R ${app_name}:${app_name} /opt/${app_name}
+
+cat > /etc/systemd/system/${app_name}.service << EOF
+[Unit]
+Description=Contoso Web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${app_name}
+WorkingDirectory=/opt/${app_name}
+Environment=NODE_ENV=${node_env}
+Environment=NEXT_TELEMETRY_DISABLED=1
+ExecStart=/usr/bin/npm start -- --hostname 0.0.0.0 --port 3000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-# Install dependencies
-echo "Installing Node.js dependencies..."
-npm ci
+systemctl daemon-reload
+systemctl enable --now ${app_name}.service
 
-# Build the Next.js application
-echo "Building Next.js application..."
-npm run build
+for attempt in $(seq 1 60); do
+  if curl --fail --silent http://127.0.0.1:3000/ > /dev/null; then
+    echo "Contoso Web is healthy on port 3000. Chat is disabled."
+    exit 0
+  fi
+  sleep 2
+done
 
-# Create PM2 ecosystem configuration
-cat > ecosystem.config.js << EOF
-module.exports = {
-  apps: [{
-    name: '${app_name}',
-    script: 'node_modules/.bin/next',
-    args: 'start',
-    instances: 'max',
-    exec_mode: 'cluster',
-    env: {
-      NODE_ENV: '${node_env}',
-      PORT: 3000
-    },
-    error_file: './logs/error.log',
-    out_file: './logs/out.log',
-    log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
-  }]
-};
-EOF
-
-# Create logs directory
-mkdir -p ./logs
-
-# Start application with PM2
-echo "Starting ${app_name} application with PM2..."
-pm2 start ecosystem.config.js
-pm2 save
-pm2 startup
-
-# Enable PM2 to start on boot
-env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u root --hp /root
-
-# Print deployment summary
-echo "========================================="
-echo "Contoso Web deployment completed!"
-echo "========================================="
-echo "Application: ${app_name}"
-echo "Node Environment: ${node_env}"
-echo "Application Directory: /opt/${app_name}"
-echo "Port: 3000 (via ALB on port 80)"
-echo "PM2 Status: $(pm2 status)"
-echo ""
-echo "To view logs:"
-echo "  PM2: pm2 logs"
-echo "  Application logs: cat /opt/${app_name}/logs/out.log"
-echo ""
-echo "Chat functionality has been disabled."
-echo "========================================="
+echo "Application did not become healthy. Recent service logs:" >&2
+journalctl -u ${app_name}.service --no-pager -n 100
+exit 1
